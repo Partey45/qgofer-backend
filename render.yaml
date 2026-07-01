@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: qgofer-backend
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: PORT
+        value: 3001
+      - key: YOUTUBE_API_KEY
+        value: AIzaSyCJF8yC3tZUMdyHZqaDgICHdtWc0SEKNqM
+      - key: TWITTER_BEARER
+        value: AAAAAAAAAAAAAAAAAAAAALuz%2BQEAAAAAhZM4Sy43Z8BEMZBHv%2BtXjfwBAEU%3DgBUYY785Dea5xRhWAKtXCp1ymGPBqUQHUZKHRNebPw3Fpcc7XX
+    healthCheckPath: /api/health
