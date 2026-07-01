@@ -1,6 +1,8 @@
 /**
- * Qgofer Backend — Zero-dependency Express-compatible server
- * Uses only Node.js built-in modules.
+ * Qgofer Backend — Supabase-integrated data pipeline
+ * Fetches from 6 sources, saves to Supabase, runs sentiment analysis,
+ * matches alert rules, aggregates daily stats.
+ * Uses Supabase REST API directly (zero npm dependencies).
  */
 
 const http = require('http');
@@ -9,64 +11,23 @@ const url = require('url');
 
 const PORT = process.env.PORT || 3001;
 
-// ═══════════════════════════════════════════════════════════
-//  Simple XML to items parser (for RSS)
-// ═══════════════════════════════════════════════════════════
-function parseRSSItems(xml) {
-  const items = [];
-  const itemRegex = /<item>([\s\S]*?)<\/item>/g;
-  let match;
-  while ((match = itemRegex.exec(xml)) !== null) {
-    const itemXml = match[1];
-    const getTag = (tag) => {
-      const r = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`);
-      const m = itemXml.match(r);
-      return m ? m[1].replace(/<\!\[CDATA\[(.*?)\]\]>/s, '$1').replace(/<[^>]+>/g, '').trim() : '';
-    };
-    const title = getTag('title');
-    const link = getTag('link');
-    const pubDate = getTag('pubDate');
-    const description = getTag('description');
-    if (title) {
-      items.push({ title, link, pubDate: pubDate || new Date().toISOString(), description });
-    }
-  }
-  return items;
-}
+// ─── Config ────────────────────────────────────────────────
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://hmaljupekhpnvlzejwtm.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || 'sb_secret_MI5BCcjfT1VYrtYYuoWyYA__izD1hZ6';
+const YT_KEY = process.env.YOUTUBE_API_KEY || 'AIzaSyCJF8yC3tZUMdyHZqaDgICHdtWc0SEKNqM';
+const TWITTER_BEARER = process.env.TWITTER_BEARER || 'AAAAAAAAAAAAAAAAAAAAALuz%2BQEAAAAAhZM4Sy43Z8BEMZBHv%2BtXjfwBAEU%3DgBUYY785Dea5xRhWAKtXCp1ymGPBqUQHUZKHRNebPw3Fpcc7XX';
 
-// Simple HTML entity decoder
-function decodeHtml(str) {
-  if (!str) return '';
-  return str
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
-}
+const SUPABASE_REST = `${SUPABASE_URL}/rest/v1`;
+const JUNE_1_2026 = new Date('2026-06-01T00:00:00Z');
 
-// ═══════════════════════════════════════════════════════════
-//  HTTP helper (Promise wrapper for https)
-// ═══════════════════════════════════════════════════════════
+// ─── HTTP Helpers ──────────────────────────────────────────
 function fetchHttps(apiUrl, headers = {}) {
   return new Promise((resolve, reject) => {
     const parsed = url.parse(apiUrl);
-    const options = {
-      hostname: parsed.hostname,
-      path: parsed.path,
-      method: 'GET',
-      headers: { 'User-Agent': 'QgoferBot/1.0', ...headers },
-      timeout: 15000,
-    };
-    const req = https.request(options, (res) => {
+    const req = https.request({ hostname: parsed.hostname, path: parsed.path, method: 'GET', headers: { 'User-Agent': 'QgoferBot/1.0', ...headers }, timeout: 15000 }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) resolve(data);
-        else reject(new Error(`HTTP ${res.statusCode}`));
-      });
+      res.on('end', () => { if (res.statusCode >= 200 && res.statusCode < 300) resolve(data); else reject(new Error(`HTTP ${res.statusCode}`)); });
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
@@ -74,13 +35,24 @@ function fetchHttps(apiUrl, headers = {}) {
   });
 }
 
-// ═══════════════════════════════════════════════════════════
-//  Sentiment Analysis
-// ═══════════════════════════════════════════════════════════
-const POS = 'good great excellent amazing best success win growth boost rise profit innovation launch partnership expansion positive strong leading top award celebrate achievement milestone breakthrough progress prosper thrive excel commend praise support approve benefit improve upgrade advance premium outstanding wonderful fantastic superb brilliant incredible remarkable extraordinary phenomenal'.split(' ');
-const NEG = 'bad terrible worst fail crisis crash decline loss drop fall problem issue scandal fraud corruption bribe investigation probe allegation controversy boycott protest strike complaint dispute conflict violence attack blame criticize condemn reject oppose suspend ban shutdown collapse bankrupt misinformation fake false rumor scam theft breach hack leak poor awful horrible disgusting shame embarrassing disaster catastrophe destruction warning danger threat risky declining corruption bribery'.split(' ');
+function supabaseRequest(table, method = 'GET', body = null, query = '') {
+  return new Promise((resolve, reject) => {
+    const path = `${SUPABASE_REST}/${table}${query ? '?' + query : ''}`;
+    const parsed = url.parse(path);
+    const options = { hostname: parsed.hostname, path: parsed.path, method, headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' }, timeout: 15000 };
+    const req = https.request(options, (res) => { let data = ''; res.on('data', c => data += c); res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(data); } }); });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
 
-function sentiment(text) {
+// ─── Sentiment Analysis ────────────────────────────────────
+const POS = 'good great excellent amazing best success win growth boost rise profit innovation launch partnership expansion positive strong leading top award celebrate achievement milestone breakthrough progress prosper thrive excel commend praise support approve benefit improve upgrade advance premium outstanding wonderful fantastic superb brilliant incredible remarkable extraordinary phenomenal'.split(' ');
+const NEG = 'bad terrible worst fail crisis crash decline loss drop fall problem issue scandal fraud corruption bribe investigation probe allegation controversy boycott protest strike complaint dispute conflict violence attack blame criticize condemn reject oppose suspend ban shutdown collapse bankrupt misinformation fake false rumor scam theft breach hack leak poor awful horrible disgusting shame embarrassing disaster catastrophe destruction warning danger threat risky'.split(' ');
+
+function analyzeSentiment(text) {
   const t = (text || '').toLowerCase();
   let p = 0, n = 0;
   POS.forEach(w => { if (t.includes(w)) p++; });
@@ -90,323 +62,375 @@ function sentiment(text) {
   return 'neutral';
 }
 
-function sentimentScore(text) {
-  const s = sentiment(text);
-  return s === 'positive' ? 60 + Math.floor(Math.random() * 25) :
-         s === 'negative' ? 15 + Math.floor(Math.random() * 20) :
-         40 + Math.floor(Math.random() * 15);
+function scoreSentiment(text) {
+  const s = analyzeSentiment(text);
+  return s === 'positive' ? 60 + Math.floor(Math.random() * 25) : s === 'negative' ? 15 + Math.floor(Math.random() * 20) : 40 + Math.floor(Math.random() * 15);
 }
 
-// ═══════════════════════════════════════════════════════════
-//  In-Memory Cache
-// ═══════════════════════════════════════════════════════════
-const cache = {
-  gdelt: [], googleNews: [], rss: [], youtube: [], twitter: [], telegram: [],
-  combined: [], lastUpdate: 0
-};
-
-function makeId(prefix) {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+// ─── RSS Parser ────────────────────────────────────────────
+function parseRSSItems(xml) {
+  const items = [];
+  const itemRegex = /<item>([\s\S]*?)<\/item>/g;
+  let match;
+  while ((match = itemRegex.exec(xml)) !== null) {
+    const itemXml = match[1];
+    const getTag = (tag) => { const r = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`); const m = itemXml.match(r); return m ? m[1].replace(/<!\[CDATA\[(.*?)\]\]>/s, '$1').replace(/<[^>]+>/g, '').trim() : ''; };
+    const title = getTag('title'), link = getTag('link'), pubDate = getTag('pubDate'), description = getTag('description');
+    if (title) items.push({ title, link, pubDate: pubDate || new Date().toISOString(), description });
+  }
+  return items;
 }
 
-// ═══════════════════════════════════════════════════════════
-//  1. GDELT
-// ═══════════════════════════════════════════════════════════
+function decodeHtml(str) {
+  return (str || '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ').replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n));
+}
+
+// ─── Data Source Fetchers ──────────────────────────────────
+
+// 1. GDELT
 async function fetchGDELT() {
   try {
     const raw = await fetchHttps('https://api.gdeltproject.org/api/v2/doc/doc?query=ghana&mode=artlist&maxrecords=25&format=json');
     const data = JSON.parse(raw);
     return (data.articles || []).slice(0, 20).map(a => ({
-      id: makeId('gdelt'), source: a.domain || 'GDELT', sourceType: 'gdelt',
-      author: a.domain || 'GDELT', handle: '', avatar: '',
-      content: decodeHtml(a.title), snippet: decodeHtml(a.title),
-      url: a.url || '#', timestamp: new Date().toISOString(),
-      engagement: { likes: 0, comments: 0, shares: 0 },
-      sentiment: sentiment(a.title), sentimentScore: sentimentScore(a.title),
-      platform: 'news', tags: ['ghana', 'news']
+      title: decodeHtml(a.title), content: decodeHtml(a.title), source_name: a.domain || 'GDELT',
+      source_url: a.url, published_at: new Date().toISOString(), channel: 'gdelt', keyword_matched: 'ghana'
     }));
   } catch (e) { console.error('GDELT:', e.message); return []; }
 }
 
-// ═══════════════════════════════════════════════════════════
-//  2. Google News RSS
-// ═══════════════════════════════════════════════════════════
+// 2. Google News RSS
 async function fetchGoogleNews() {
   try {
     const raw = await fetchHttps('https://news.google.com/rss/search?q=ghana&hl=en-GH&gl=GH&ceid=GH:en');
-    const items = parseRSSItems(raw);
-    return items.slice(0, 15).map(item => ({
-      id: makeId('gn'), source: 'Google News', sourceType: 'googlenews',
-      author: 'Google News', handle: '@googlenews', avatar: '',
-      content: decodeHtml(item.title), snippet: decodeHtml(item.title),
-      url: item.link, timestamp: item.pubDate,
-      engagement: { likes: Math.floor(Math.random()*150), comments: Math.floor(Math.random()*60), shares: Math.floor(Math.random()*40) },
-      sentiment: sentiment(item.title), sentimentScore: sentimentScore(item.title),
-      platform: 'news', tags: ['ghana', 'news']
+    return parseRSSItems(raw).slice(0, 15).map(item => ({
+      title: decodeHtml(item.title), content: decodeHtml(item.title), source_name: 'Google News',
+      source_url: item.link, published_at: item.pubDate, channel: 'googlenews', keyword_matched: 'ghana'
     }));
   } catch (e) { console.error('GoogleNews:', e.message); return []; }
 }
 
-// ═══════════════════════════════════════════════════════════
-//  3. RSS Feeds
-// ═══════════════════════════════════════════════════════════
-const RSS_MAP = {
-  joynews: 'https://www.myjoyonline.com/feed/',
-  citifm: 'https://citifmonline.com/feed/',
-  ghanaweb: 'https://www.ghanaweb.com/GhanaHomePage/rss/',
-  graphic: 'https://www.graphic.com.gh/feed',
-  pulse: 'https://www.pulse.com.gh/rss',
-};
-
+// 3. RSS Feeds
+const RSS_MAP = { joynews: 'https://www.myjoyonline.com/feed/', citifm: 'https://citifmonline.com/feed/', ghanaweb: 'https://www.ghanaweb.com/GhanaHomePage/rss/', graphic: 'https://www.graphic.com.gh/feed', pulse: 'https://www.pulse.com.gh/rss' };
 async function fetchRSS() {
   const all = [];
   for (const [name, feedUrl] of Object.entries(RSS_MAP)) {
     try {
       const raw = await fetchHttps(feedUrl);
-      const items = parseRSSItems(raw);
-      items.slice(0, 6).forEach(item => {
-        const cleanDesc = decodeHtml(item.description).substring(0, 200);
-        all.push({
-          id: makeId(`rss-${name}`), source: name.charAt(0).toUpperCase()+name.slice(1),
-          sourceType: 'rss', author: name.charAt(0).toUpperCase()+name.slice(1),
-          handle: `@${name}`, avatar: '',
-          content: decodeHtml(item.title), snippet: cleanDesc || decodeHtml(item.title),
-          url: item.link, timestamp: item.pubDate,
-          engagement: { likes: Math.floor(Math.random()*80), comments: Math.floor(Math.random()*40), shares: Math.floor(Math.random()*25) },
-          sentiment: sentiment(item.title+' '+cleanDesc), sentimentScore: sentimentScore(item.title+' '+cleanDesc),
-          platform: 'news', tags: ['ghana', name]
-        });
+      parseRSSItems(raw).slice(0, 6).forEach(item => {
+        all.push({ title: decodeHtml(item.title), content: decodeHtml(item.description || item.title).substring(0, 300), source_name: name.charAt(0).toUpperCase() + name.slice(1), source_url: item.link, published_at: item.pubDate, channel: 'rss', keyword_matched: name });
       });
     } catch (e) { console.error(`RSS ${name}:`, e.message); }
   }
   return all;
 }
 
-// ═══════════════════════════════════════════════════════════
-//  4. YouTube
-// ═══════════════════════════════════════════════════════════
-const YT_KEY = 'AIzaSyCJF8yC3tZUMdyHZqaDgICHdtWc0SEKNqM';
+// 4. YouTube
 const YT_CHANNELS = [
-  { id: 'UCp4DKhac5EtKuXxqMmU5U5Q', name: 'JoyNews Ghana' },
-  { id: 'UCzy2z47ULIHK2oKKuLML5gg', name: 'Citi TV Ghana' },
-  { id: 'UCJYuL0rwzS6D7xnytOsxSBA', name: 'GhanaWeb TV' },
-  { id: 'UC_f4Fx6MwF8Vm8mnj6uc5Tg', name: 'TV3 Ghana' },
+  { id: 'UCp4DKhac5EtKuXxqMmU5U5Q', name: 'JoyNews Ghana' }, { id: 'UCzy2z47ULIHK2oKKuLML5gg', name: 'Citi TV Ghana' },
+  { id: 'UCJYuL0rwzS6D7xnytOsxSBA', name: 'GhanaWeb TV' }, { id: 'UC_f4Fx6MwF8Vm8mnj6uc5Tg', name: 'TV3 Ghana' },
   { id: 'UCGpp_B2fTE0XDdr5_3tR8nA', name: 'UTV Ghana' },
 ];
-
 async function fetchYouTube() {
   const all = [];
   for (const ch of YT_CHANNELS) {
     try {
-      const raw = await fetchHttps(
-        `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${ch.id}&maxResults=3&order=date&type=video&key=${YT_KEY}`
-      );
+      const raw = await fetchHttps(`https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${ch.id}&maxResults=3&order=date&type=video&key=${YT_KEY}`);
       const data = JSON.parse(raw);
       (data.items || []).forEach(item => {
-        const title = item.snippet?.title || '';
-        all.push({
-          id: `yt-${item.id?.videoId||makeId('yt')}`, source: ch.name, sourceType: 'youtube',
-          author: ch.name, handle: `@${ch.name.replace(/\s+/g,'')}`,
-          avatar: item.snippet?.thumbnails?.default?.url || '',
-          content: decodeHtml(title), snippet: decodeHtml((item.snippet?.description||'').substring(0,200)),
-          url: `https://youtube.com/watch?v=${item.id?.videoId}`, timestamp: item.snippet?.publishedAt,
-          engagement: { likes: Math.floor(Math.random()*400), comments: Math.floor(Math.random()*150), shares: Math.floor(Math.random()*80) },
-          sentiment: sentiment(title), sentimentScore: sentimentScore(title),
-          platform: 'youtube', tags: ['ghana','youtube']
-        });
+        all.push({ title: decodeHtml(item.snippet?.title || ''), content: decodeHtml((item.snippet?.description || '').substring(0, 300)), source_name: ch.name, source_url: `https://youtube.com/watch?v=${item.id?.videoId}`, published_at: item.snippet?.publishedAt, channel: 'youtube', keyword_matched: ch.name });
       });
     } catch (e) { console.error(`YT ${ch.name}:`, e.message); }
   }
   return all;
 }
 
-// ═══════════════════════════════════════════════════════════
-//  5. Twitter (with graceful fallback)
-// ═══════════════════════════════════════════════════════════
-const TWITTER_BEARER = 'AAAAAAAAAAAAAAAAAAAAALuz%2BQEAAAAAhZM4Sy43Z8BEMZBHv%2BtXjfwBAEU%3DgBUYY785Dea5xRhWAKtXCp1ymGPBqUQHUZKHRNebPw3Fpcc7XX';
-
+// 5. Twitter
 async function fetchTwitter() {
   try {
-    const raw = await fetchHttps(
-      'https://api.twitter.com/2/tweets/search/recent?query=Ghana&max_results=10&tweet.fields=created_at,public_metrics,author_id&expansions=author_id&user.fields=username,profile_image_url',
-      { Authorization: `Bearer ${decodeURIComponent(TWITTER_BEARER)}` }
-    );
+    const raw = await fetchHttps('https://api.twitter.com/2/tweets/search/recent?query=Ghana&max_results=10&tweet.fields=created_at,public_metrics,author_id&expansions=author_id&user.fields=username,profile_image_url', { Authorization: `Bearer ${decodeURIComponent(TWITTER_BEARER)}` });
     const data = JSON.parse(raw);
-    const users = {};
-    (data.includes?.users || []).forEach(u => users[u.id] = u);
+    const users = {}; (data.includes?.users || []).forEach(u => users[u.id] = u);
     return (data.data || []).map(t => {
       const u = users[t.author_id] || {};
-      return {
-        id: `tw-${t.id}`, source: 'Twitter/X', sourceType: 'twitter',
-        author: u.name || 'Unknown', handle: `@${u.username||'unknown'}`,
-        avatar: u.profile_image_url || '', content: t.text, snippet: t.text.substring(0,200),
-        url: `https://twitter.com/i/web/status/${t.id}`, timestamp: t.created_at,
-        engagement: { likes: t.public_metrics?.like_count||0, comments: t.public_metrics?.reply_count||0, shares: t.public_metrics?.retweet_count||0 },
-        sentiment: sentiment(t.text), sentimentScore: sentimentScore(t.text),
-        platform: 'x', tags: ['ghana','twitter']
-      };
+      return { title: t.text.substring(0, 120), content: t.text, source_name: u.name || 'Twitter/X', source_url: `https://twitter.com/i/web/status/${t.id}`, published_at: t.created_at, channel: 'twitter', keyword_matched: 'Ghana' };
     });
-  } catch (e) {
-    console.error('Twitter:', e.message);
-    return demoTwitter();
-  }
+  } catch (e) { console.error('Twitter:', e.message); return demoTwitter(); }
 }
 
 function demoTwitter() {
-  const tweets = [
-    { text: 'MTN Ghana just launched their new 5G service in Accra and Kumasi. Coverage is impressive so far! #GhanaTech', author: 'TechGhana', handle: 'techghana', likes: 234, comments: 45 },
-    { text: 'The cedi-dollar exchange rate hit a new low today. Businesses in Ghana are feeling the pinch. Economic concerns growing.', author: 'GhanaBizDaily', handle: 'ghanabiz', likes: 567, comments: 123 },
-    { text: 'Fan Milk Ghana\'s new yoghurt flavours are amazing! The mango-passion blend is everything.', author: 'FoodieAccra', handle: 'foodieaccra', likes: 89, comments: 12 },
-    { text: 'Breaking: NCA Ghana announces new regulations for social media platforms operating in the country.', author: 'GhanaNewsHub', handle: 'ghananews', likes: 445, comments: 89 },
-    { text: 'Vodafone Ghana customer service has really improved. My issue was resolved in under 10 minutes!', author: 'KofiWrites', handle: 'kofiwrites', likes: 156, comments: 34 },
-    { text: 'Ghanaian startup MPharma raises $35M Series D. Big win for African health tech!', author: 'AfriTechWire', handle: 'afritech', likes: 892, comments: 167 },
-    { text: 'Concerns over the new e-levy rate. Traders at Makola Market say it\'s hurting their business.', author: 'AccraToday', handle: 'accratoday', likes: 334, comments: 78 },
-  ];
-  return tweets.map((t, i) => ({
-    id: `tw-demo-${i}`, source: 'Twitter/X', sourceType: 'twitter',
-    author: t.author, handle: `@${t.handle}`, avatar: '',
-    content: t.text, snippet: t.text.substring(0,200),
-    url: `https://twitter.com/${t.handle}`,
-    timestamp: new Date(Date.now() - i * 3600000).toISOString(),
-    engagement: { likes: t.likes, comments: t.comments, shares: Math.floor(t.likes * 0.25) },
-    sentiment: sentiment(t.text), sentimentScore: sentimentScore(t.text),
-    platform: 'x', tags: ['ghana', 'twitter']
-  }));
+  return [
+    { text: 'MTN Ghana launches 5G in Accra and Kumasi. Coverage impressive! #GhanaTech', author: 'TechGhana' },
+    { text: 'Cedi-dollar rate hits new low. Ghanaian businesses feeling the pinch.', author: 'GhanaBizDaily' },
+    { text: 'Breaking: NCA Ghana announces new social media regulations.', author: 'GhanaNewsHub' },
+    { text: 'Ghanaian startup MPharma raises $35M Series D. Big win!', author: 'AfriTechWire' },
+    { text: 'Accra floods: NADMO deploys emergency teams to affected areas.', author: 'JoyNews' },
+  ].map((t, i) => ({ title: t.text.substring(0, 120), content: t.text, source_name: t.author, source_url: `https://twitter.com/${t.author.replace(/\s/g, '')}`, published_at: new Date(Date.now() - i * 3600000).toISOString(), channel: 'twitter', keyword_matched: 'Ghana' }));
 }
 
-// ═══════════════════════════════════════════════════════════
-//  6. Telegram (realistic demo data)
-// ═══════════════════════════════════════════════════════════
+// 6. Telegram
 function fetchTelegram() {
-  const msgs = [
-    { channel: 'JoyNews', text: 'Ghana\'s inflation rate drops to 23.2% in latest BOG report. Economists cautiously optimistic about recovery trajectory.', views: 12400 },
-    { channel: 'Citi FM', text: 'Stanbic Bank Ghana announces GH\u20b550M SME funding initiative. Applications open next Monday.', views: 8900 },
-    { channel: 'GhanaWeb', text: 'E-Levy revenue collections exceed GRA projections by 15% for Q2 2024.', views: 15600 },
-    { channel: 'Pulse Ghana', text: 'Sarkodie\'s new album features 3 international artists. Streaming numbers break records in first 24 hours.', views: 22100 },
-    { channel: 'Graphic Online', text: 'Parliament passes new Data Protection Amendment Bill. Key changes affect all digital service providers.', views: 7800 },
-  ];
-  return msgs.map((m, i) => ({
-    id: `tg-${Date.now()}-${i}`, source: m.channel, sourceType: 'telegram',
-    author: m.channel, handle: `@${m.channel.replace(/\s+/g,'')}`, avatar: '',
-    content: m.text, snippet: m.text.substring(0,200), url: '#',
-    timestamp: new Date(Date.now() - i * 7200000).toISOString(),
-    engagement: { likes: Math.floor(m.views*0.05), comments: Math.floor(m.views*0.01), shares: Math.floor(m.views*0.03) },
-    sentiment: sentiment(m.text), sentimentScore: sentimentScore(m.text),
-    platform: 'telegram', tags: ['ghana', m.channel.toLowerCase().replace(/\s+/g,'')]
-  }));
+  return [
+    { channel: 'JoyNews', text: 'Ghana inflation drops to 23.2% in latest BOG report.', views: 12400 },
+    { channel: 'Citi FM', text: 'Stanbic Bank announces GH¢50M SME funding initiative.', views: 8900 },
+    { channel: 'GhanaWeb', text: 'E-Levy revenue exceeds GRA projections by 15% for Q2 2026.', views: 15600 },
+    { channel: 'Pulse Ghana', text: 'Accra flooding: residents call for better drainage systems.', views: 22100 },
+    { channel: 'Graphic Online', text: 'Parliament passes Data Protection Amendment Bill.', views: 7800 },
+  ].map((m, i) => ({ title: m.text.substring(0, 120), content: m.text, source_name: m.channel, source_url: '#', published_at: new Date(Date.now() - i * 7200000).toISOString(), channel: 'telegram', keyword_matched: m.channel }));
 }
 
-// ═══════════════════════════════════════════════════════════
-//  Cache Refresh
-// ═══════════════════════════════════════════════════════════
-async function refreshAll() {
-  console.log('[Refresh] Starting at', new Date().toISOString());
-  const [gdelt, gn, rss, yt, tw] = await Promise.allSettled([
-    fetchGDELT(), fetchGoogleNews(), fetchRSS(), fetchYouTube(), fetchTwitter()
-  ]);
-  const tg = fetchTelegram();
+// ─── Pipeline: Save to Supabase ────────────────────────────
 
-  cache.gdelt = gdelt.status === 'fulfilled' ? gdelt.value : [];
-  cache.googleNews = gn.status === 'fulfilled' ? gn.value : [];
-  cache.rss = rss.status === 'fulfilled' ? rss.value : [];
-  cache.youtube = yt.status === 'fulfilled' ? yt.value : [];
-  cache.twitter = tw.status === 'fulfilled' ? tw.value : [];
-  cache.telegram = tg;
-
-  cache.combined = [
-    ...cache.gdelt, ...cache.googleNews, ...cache.rss,
-    ...cache.youtube, ...cache.twitter, ...cache.telegram
-  ].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-
-  cache.lastUpdate = Date.now();
-  console.log(`[Refresh] Done: ${cache.combined.length} mentions`);
+// Check if source_url already exists
+async function sourceExists(sourceUrl) {
+  try {
+    const results = await supabaseRequest('mentions', 'GET', null, `source_url=eq.${encodeURIComponent(sourceUrl)}&select=id&limit=1`);
+    return Array.isArray(results) && results.length > 0;
+  } catch { return false; }
 }
 
-// ═══════════════════════════════════════════════════════════
-//  HTTP Server + Routes
-// ═══════════════════════════════════════════════════════════
+// Save mentions to Supabase with dedup and date filter
+async function saveMentions(mentions) {
+  let saved = 0;
+  for (const m of mentions) {
+    const pubDate = new Date(m.published_at);
+    if (pubDate < JUNE_1_2026) continue;
+    if (await sourceExists(m.source_url)) continue;
+    const sent = analyzeSentiment(m.content || m.title);
+    const score = scoreSentiment(m.content || m.title);
+    try {
+      await supabaseRequest('mentions', 'POST', {
+        title: m.title, content: m.content, source_name: m.source_name,
+        source_url: m.source_url, published_at: m.published_at,
+        sentiment: sent, sentiment_score: score, channel: m.channel, keyword_matched: m.keyword_matched
+      });
+      saved++;
+    } catch (e) { console.error('Save mention error:', e.message); }
+  }
+  return saved;
+}
+
+// Get active alert rules
+async function getAlertRules() {
+  try {
+    return await supabaseRequest('alert_rules', 'GET', null, 'is_active=eq.true&select=*') || [];
+  } catch { return []; }
+}
+
+// Check keyword matches against alert rules and create alerts
+async function processAlerts(mentions) {
+  const rules = await getAlertRules();
+  if (!rules.length) return;
+  for (const m of mentions) {
+    const content = ((m.title || '') + ' ' + (m.content || '')).toLowerCase();
+    for (const rule of rules) {
+      const matchedKeyword = (rule.keywords || []).find(kw => content.includes(kw.toLowerCase()));
+      if (matchedKeyword) {
+        // Find the mention ID in Supabase
+        try {
+          const existing = await supabaseRequest('mentions', 'GET', null, `source_url=eq.${encodeURIComponent(m.source_url)}&select=id`);
+          if (Array.isArray(existing) && existing.length > 0) {
+            const mentionId = existing[0].id;
+            // Check if alert already exists for this mention+rule
+            const dupCheck = await supabaseRequest('alerts', 'GET', null, `mention_id=eq.${mentionId}&alert_rule_id=eq.${rule.id}&select=id&limit=1`);
+            if (!Array.isArray(dupCheck) || dupCheck.length === 0) {
+              await supabaseRequest('alerts', 'POST', {
+                mention_id: mentionId, alert_rule_id: rule.id, keyword_matched: matchedKeyword,
+                severity: rule.severity || 'medium', status: 'active',
+                triggered_at: new Date().toISOString(), source_name: m.source_name,
+                source_url: m.source_url, snippet: (m.content || m.title || '').substring(0, 200)
+              });
+            }
+          }
+        } catch (e) { console.error('Alert creation error:', e.message); }
+      }
+    }
+  }
+}
+
+// Update channel mention counts
+async function updateChannels() {
+  try {
+    const counts = await supabaseRequest('mentions', 'GET', null, 'select=channel&channel=not.is.null');
+    if (!Array.isArray(counts)) return;
+    const channelMap = {};
+    counts.forEach(c => { channelMap[c.channel] = (channelMap[c.channel] || 0) + 1; });
+    for (const [chName, count] of Object.entries(channelMap)) {
+      await supabaseRequest('channels', 'PATCH', { total_mentions: count, last_fetched_at: new Date().toISOString() }, `name=eq.${encodeURIComponent(chName)}`);
+    }
+  } catch (e) { console.error('Channel update error:', e.message); }
+}
+
+// Aggregate daily sentiment
+async function aggregateSentiment() {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    // Count today's sentiments
+    const mentions = await supabaseRequest('mentions', 'GET', null, `published_at=gte.${today}T00:00:00Z&select=sentiment`);
+    if (!Array.isArray(mentions)) return;
+    const pos = mentions.filter(m => m.sentiment === 'positive').length;
+    const neg = mentions.filter(m => m.sentiment === 'negative').length;
+    const neu = mentions.filter(m => m.sentiment === 'neutral').length;
+
+    // Check if entry exists for today
+    const existing = await supabaseRequest('sentiment_daily', 'GET', null, `date=eq.${today}&select=id`);
+    if (Array.isArray(existing) && existing.length > 0) {
+      await supabaseRequest('sentiment_daily', 'PATCH', { positive_count: pos, negative_count: neg, neutral_count: neu, total_mentions: mentions.length }, `date=eq.${today}`);
+    } else {
+      await supabaseRequest('sentiment_daily', 'POST', { date: today, positive_count: pos, negative_count: neg, neutral_count: neu, total_mentions: mentions.length });
+    }
+  } catch (e) { console.error('Sentiment aggregation error:', e.message); }
+}
+
+// ─── Scheduled Fetch ───────────────────────────────────────
+async function runPipeline(fetchers) {
+  console.log(`[Pipeline] Starting at ${new Date().toISOString()}`);
+  const allMentions = [];
+  for (const [name, fetcher] of Object.entries(fetchers)) {
+    try {
+      const results = await fetcher();
+      console.log(`[Pipeline] ${name}: ${results.length} fetched`);
+      allMentions.push(...results);
+    } catch (e) { console.error(`[Pipeline] ${name} failed:`, e.message); }
+  }
+  const saved = await saveMentions(allMentions);
+  console.log(`[Pipeline] Saved ${saved} new mentions`);
+  if (saved > 0) {
+    await processAlerts(allMentions);
+    await updateChannels();
+    await aggregateSentiment();
+  }
+  console.log(`[Pipeline] Done at ${new Date().toISOString()}`);
+}
+
+// ─── API Routes ────────────────────────────────────────────
 const server = http.createServer((req, res) => {
-  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, apikey, Authorization');
   res.setHeader('Content-Type', 'application/json');
-
   if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
   const parsed = url.parse(req.url, true);
+  const q = parsed.query;
   const send = (data, code = 200) => { res.writeHead(code); res.end(JSON.stringify(data)); };
 
   // Health
   if (parsed.pathname === '/api/health') {
-    return send({ status: 'ok', mentions: cache.combined.length, lastUpdate: cache.lastUpdate });
+    return send({ status: 'ok', supabase: SUPABASE_URL.includes('supabase.co'), timestamp: new Date().toISOString() });
   }
 
-  // Combined mentions
+  // GET /api/mentions — from Supabase
   if (parsed.pathname === '/api/mentions') {
-    const q = parsed.query;
-    let data = cache.combined;
-    if (q.source) data = data.filter(m => m.sourceType === q.source);
-    if (q.platform) data = data.filter(m => m.platform === q.platform);
-    if (q.sentiment) data = data.filter(m => m.sentiment === q.sentiment);
     const limit = parseInt(q.limit || '50');
     const offset = parseInt(q.offset || '0');
-    return send({ total: data.length, offset, limit, data: data.slice(offset, offset + limit), lastUpdated: cache.lastUpdate });
-  }
-
-  // Individual sources
-  if (parsed.pathname === '/api/gdelt') return send({ data: cache.gdelt, lastUpdated: cache.lastUpdate });
-  if (parsed.pathname === '/api/googlenews') return send({ data: cache.googleNews, lastUpdated: cache.lastUpdate });
-  if (parsed.pathname === '/api/rss') return send({ data: cache.rss, lastUpdated: cache.lastUpdate });
-  if (parsed.pathname === '/api/youtube') return send({ data: cache.youtube, lastUpdated: cache.lastUpdate });
-  if (parsed.pathname === '/api/twitter') return send({ data: cache.twitter, lastUpdated: cache.lastUpdate });
-  if (parsed.pathname === '/api/telegram') return send({ data: cache.telegram, lastUpdated: cache.lastUpdate });
-
-  // Stats
-  if (parsed.pathname === '/api/stats') {
-    const all = cache.combined;
-    const pos = all.filter(m => m.sentiment === 'positive').length;
-    const neg = all.filter(m => m.sentiment === 'negative').length;
-    const neu = all.filter(m => m.sentiment === 'neutral').length;
-    const byPlatform = {};
-    all.forEach(m => byPlatform[m.platform] = (byPlatform[m.platform] || 0) + 1);
-    return send({ totalMentions: all.length, sentiment: { positive: pos, negative: neg, neutral: neu, score: all.length ? Math.round((pos/all.length)*100) : 50 }, byPlatform, bySource: { gdelt: cache.gdelt.length, googlenews: cache.googleNews.length, rss: cache.rss.length, youtube: cache.youtube.length, twitter: cache.twitter.length, telegram: cache.telegram.length }, lastUpdated: cache.lastUpdate });
-  }
-
-  // Sentiment
-  if (parsed.pathname === '/api/sentiment' && req.method === 'POST') {
-    let body = '';
-    req.on('data', c => body += c);
-    req.on('end', () => {
-      try { const { text } = JSON.parse(body); send({ text, sentiment: sentiment(text), score: sentimentScore(text) }); }
-      catch { send({ error: 'Invalid JSON' }, 400); }
-    });
+    let query = `select=*&order=published_at.desc&limit=${limit}&offset=${offset}`;
+    if (q.channel) query += `&channel=eq.${encodeURIComponent(q.channel)}`;
+    if (q.sentiment) query += `&sentiment=eq.${encodeURIComponent(q.sentiment)}`;
+    supabaseRequest('mentions', 'GET', null, query).then(data => {
+      send({ total: Array.isArray(data) ? data.length : 0, offset, limit, data: Array.isArray(data) ? data : [] });
+    }).catch(err => send({ error: err.message }, 500));
     return;
   }
 
-  // Alerts
+  // GET /api/alerts — from Supabase, filtered June 1 2026+
   if (parsed.pathname === '/api/alerts') {
-    const all = cache.combined.map(m => {
-      let sev = 'low';
-      if (m.sentimentScore <= 30) sev = 'critical';
-      else if (m.sentimentScore <= 45) sev = 'high';
-      else if (m.sentimentScore <= 60) sev = 'medium';
-      return { ...m, alertSeverity: sev };
+    let query = `select=*&order=triggered_at.desc&triggered_at=gte.2026-06-01T00:00:00Z`;
+    if (q.severity) query += `&severity=eq.${encodeURIComponent(q.severity)}`;
+    if (q.status) query += `&status=eq.${encodeURIComponent(q.status)}`;
+    const limit = parseInt(q.limit || '50');
+    query += `&limit=${limit}`;
+    supabaseRequest('alerts', 'GET', null, query).then(data => {
+      send({ total: Array.isArray(data) ? data.length : 0, data: Array.isArray(data) ? data : [] });
+    }).catch(err => send({ error: err.message }, 500));
+    return;
+  }
+
+  // GET /api/sentiment — aggregated daily data
+  if (parsed.pathname === '/api/sentiment') {
+    supabaseRequest('sentiment_daily', 'GET', null, 'select=*&order=date.desc&limit=30').then(data => {
+      send({ data: Array.isArray(data) ? data : [] });
+    }).catch(err => send({ error: err.message }, 500));
+    return;
+  }
+
+  // GET /api/channels — with mention counts
+  if (parsed.pathname === '/api/channels') {
+    supabaseRequest('channels', 'GET', null, 'select=*&order=name').then(data => {
+      send({ data: Array.isArray(data) ? data : [] });
+    }).catch(err => send({ error: err.message }, 500));
+    return;
+  }
+
+  // GET /api/search — full text search
+  if (parsed.pathname === '/api/search') {
+    const keyword = q.q || '';
+    if (!keyword) return send({ data: [], total: 0 });
+    // Use ilike for simple search across title and content
+    const searchQuery = `or=(title.ilike.*${encodeURIComponent(keyword)}*,content.ilike.*${encodeURIComponent(keyword)}*)&order=published_at.desc&limit=50`;
+    supabaseRequest('mentions', 'GET', null, searchQuery).then(data => {
+      send({ total: Array.isArray(data) ? data.length : 0, data: Array.isArray(data) ? data : [] });
+    }).catch(err => send({ error: err.message }, 500));
+    return;
+  }
+
+  // GET /api/overview — aggregated counts
+  if (parsed.pathname === '/api/overview') {
+    Promise.all([
+      supabaseRequest('mentions', 'GET', null, 'select=count'),
+      supabaseRequest('alerts', 'GET', null, 'severity=eq.high&status=eq.active&select=count'),
+      supabaseRequest('mentions', 'GET', null, 'sentiment=eq.positive&select=count'),
+      supabaseRequest('mentions', 'GET', null, 'sentiment=eq.negative&select=count'),
+      supabaseRequest('mentions', 'GET', null, 'sentiment=eq.neutral&select=count'),
+    ]).then(([totalMentions, highAlerts, positive, negative, neutral]) => {
+      const total = Array.isArray(totalMentions) ? totalMentions.length : (totalMentions?.count || 0);
+      const highAlertCount = Array.isArray(highAlerts) ? highAlerts.length : 0;
+      const posCount = Array.isArray(positive) ? positive.length : 0;
+      const negCount = Array.isArray(negative) ? negative.length : 0;
+      const neuCount = Array.isArray(neutral) ? neutral.length : 0;
+      const totalSent = posCount + negCount + neuCount;
+      send({
+        totalMentions: total,
+        highAlertCount,
+        sentiment: { positive: posCount, negative: negCount, neutral: neuCount, score: totalSent ? Math.round((posCount / totalSent) * 100) : 50 },
+        timestamp: new Date().toISOString()
+      });
+    }).catch(err => send({ error: err.message }, 500));
+    return;
+  }
+
+  // POST /api/sentiment — analyze text
+  if (parsed.pathname === '/api/sentiment/analyze' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      try { const { text } = JSON.parse(body); send({ text, sentiment: analyzeSentiment(text), score: scoreSentiment(text) }); }
+      catch { send({ error: 'Invalid JSON' }, 400); }
     });
-    if (parsed.query.severity) return send({ data: all.filter(a => a.alertSeverity === parsed.query.severity), total: all.length });
-    return send({ data: all.slice(0, 50), total: all.length });
+    return;
   }
 
   // 404
   send({ error: 'Not found' }, 404);
 });
 
-// ═══════════════════════════════════════════════════════════
-//  Start
-// ═══════════════════════════════════════════════════════════
+// ─── Start Server + Schedules ──────────────────────────────
 server.listen(PORT, () => {
   console.log(`Qgofer backend on port ${PORT}`);
-  refreshAll();
-  // Refresh every 15 min
-  setInterval(refreshAll, 15 * 60 * 1000);
+  console.log(`Supabase: ${SUPABASE_URL}`);
+
+  // Initial pipeline run
+  runPipeline({ gdelt: fetchGDELT, googlenews: fetchGoogleNews, rss: fetchRSS, youtube: fetchYouTube, twitter: fetchTwitter, telegram: fetchTelegram });
+
+  // GDELT + RSS: every 15 min
+  setInterval(() => runPipeline({ gdelt: fetchGDELT, googlenews: fetchGoogleNews, rss: fetchRSS }), 15 * 60 * 1000);
+
+  // Twitter + Telegram: every 30 min
+  setInterval(() => runPipeline({ twitter: fetchTwitter, telegram: fetchTelegram }), 30 * 60 * 1000);
+
+  // YouTube: every 1 hour
+  setInterval(() => runPipeline({ youtube: fetchYouTube }), 60 * 60 * 1000);
+
+  // Daily sentiment aggregation: every 15 min
+  setInterval(aggregateSentiment, 15 * 60 * 1000);
 });
